@@ -1,0 +1,531 @@
+// ──────────────────────────────────────────────────────────────────────────────
+// SuperLavish — Jenkins Declarative CI/CD Pipeline
+//
+// Key design: every stage uses `when { changeset '<path>/**' }` so the pipeline
+// only runs work for files that actually changed since the last successful build.
+// Result: a one-file fix in auth-service rebuilds only auth-service.
+//
+// `changeset` compares against the previous SUCCESSFUL build (not the previous
+// commit). Use this with a Multibranch Pipeline for clean per-branch behavior.
+// ──────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: maven
+      image: maven:3.9-eclipse-temurin-17-alpine
+      command: [cat]
+      tty: true
+      resources:
+        requests: { memory: "1Gi", cpu: "500m" }
+        limits:   { memory: "2Gi", cpu: "1000m" }
+      volumeMounts:
+        - name: maven-cache
+          mountPath: /root/.m2
+    - name: node
+      image: node:20-alpine
+      command: [cat]
+      tty: true
+    - name: docker
+      image: docker:24-dind
+      securityContext: { privileged: true }
+      volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+    - name: kubectl
+      image: bitnami/kubectl:latest
+      command: [cat]
+      tty: true
+    - name: terraform
+      image: hashicorp/terraform:1.9
+      command: [cat]
+      tty: true
+    - name: sonar
+      image: sonarsource/sonar-scanner-cli:latest
+      command: [cat]
+      tty: true
+  volumes:
+    - name: maven-cache
+      persistentVolumeClaim:
+        claimName: maven-cache-pvc
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+'''
+        }
+    }
+
+    environment {
+        // AWS
+        AWS_REGION       = 'ap-south-1'
+        ECR_REGISTRY     = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        EKS_CLUSTER_NAME = 'superlavish-dev-cluster'
+        K8S_NAMESPACE    = 'superlavish'
+
+        // Image tag — short git SHA for traceability
+        IMAGE_TAG        = "${env.GIT_COMMIT?.take(8) ?: 'local'}"
+
+        // Credentials configured in Jenkins
+        AWS_CREDENTIALS  = credentials('aws-credentials')
+        SONAR_TOKEN      = credentials('sonar-token')
+        SONAR_HOST_URL   = 'http://sonarqube:9000'
+
+        // Repo-relative paths (kept in one place for clarity)
+        APP_ROOT         = 'superlavish'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+
+    stages {
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 1: Checkout
+        // ──────────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_AUTHOR  = sh(script: 'git log -1 --format="%an <%ae>"', returnStdout: true).trim()
+                    env.GIT_MESSAGE = sh(script: 'git log -1 --format="%s"', returnStdout: true).trim()
+                    echo "🔄 Branch: ${env.BRANCH_NAME ?: 'unknown'}"
+                    echo "📝 Author: ${env.GIT_AUTHOR}"
+                    echo "💬 Message: ${env.GIT_MESSAGE}"
+                    echo "🏷️  Image tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 2: Build + Test Backend (per-service, only if changed)
+        // ──────────────────────────────────────────────────────────────────
+        stage('Build Backend') {
+            parallel {
+                stage('Auth Service') {
+                    when {
+                        anyOf {
+                            changeset "${APP_ROOT}/backend/auth-service/**"
+                            changeset "${APP_ROOT}/devops/docker/Dockerfile.service"
+                        }
+                    }
+                    steps {
+                        container('maven') {
+                            dir("${APP_ROOT}/backend/auth-service") {
+                                sh 'mvn clean verify -T 4 -q'
+                            }
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true,
+                                  testResults: "${APP_ROOT}/backend/auth-service/target/surefire-reports/*.xml"
+                        }
+                    }
+                }
+
+                stage('Product Service') {
+                    when {
+                        anyOf {
+                            changeset "${APP_ROOT}/backend/product-service/**"
+                            changeset "${APP_ROOT}/devops/docker/Dockerfile.service"
+                        }
+                    }
+                    steps {
+                        container('maven') {
+                            dir("${APP_ROOT}/backend/product-service") {
+                                sh 'mvn clean verify -T 4 -q'
+                            }
+                        }
+                    }
+                }
+
+                stage('Cart Service') {
+                    when {
+                        anyOf {
+                            changeset "${APP_ROOT}/backend/cart-service/**"
+                            changeset "${APP_ROOT}/devops/docker/Dockerfile.service"
+                        }
+                    }
+                    steps {
+                        container('maven') {
+                            dir("${APP_ROOT}/backend/cart-service") {
+                                sh 'mvn clean verify -T 4 -q'
+                            }
+                        }
+                    }
+                }
+
+                stage('Order Service') {
+                    when {
+                        anyOf {
+                            changeset "${APP_ROOT}/backend/order-service/**"
+                            changeset "${APP_ROOT}/devops/docker/Dockerfile.service"
+                        }
+                    }
+                    steps {
+                        container('maven') {
+                            dir("${APP_ROOT}/backend/order-service") {
+                                sh 'mvn clean verify -T 4 -q'
+                            }
+                        }
+                    }
+                }
+
+                stage('Gateway') {
+                    when {
+                        anyOf {
+                            changeset "${APP_ROOT}/backend/gateway/**"
+                            changeset "${APP_ROOT}/devops/docker/Dockerfile.service"
+                        }
+                    }
+                    steps {
+                        container('maven') {
+                            dir("${APP_ROOT}/backend/gateway") {
+                                sh 'mvn clean verify -T 4 -q'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 3: Build + Test Frontend (only if frontend changed)
+        // ──────────────────────────────────────────────────────────────────
+        stage('Build Frontend') {
+            when {
+                anyOf {
+                    changeset "${APP_ROOT}/frontend/**"
+                    changeset "${APP_ROOT}/devops/docker/Dockerfile.frontend"
+                }
+            }
+            steps {
+                container('node') {
+                    dir("${APP_ROOT}/frontend") {
+                        sh 'npm ci --silent'
+                        sh 'npm test -- --watchAll=false --coverage'
+                        sh 'npm run build'
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 4: Sonar (any code change)
+        // ──────────────────────────────────────────────────────────────────
+        stage('SonarQube Analysis') {
+            when {
+                anyOf {
+                    changeset "${APP_ROOT}/backend/**"
+                    changeset "${APP_ROOT}/frontend/**"
+                }
+            }
+            steps {
+                container('sonar') {
+                    dir("${APP_ROOT}") {
+                        sh '''
+                            sonar-scanner \
+                              -Dsonar.projectKey=superlavish \
+                              -Dsonar.host.url=${SONAR_HOST_URL} \
+                              -Dsonar.login=${SONAR_TOKEN}
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 5: Docker Build + Push (per-service, only if changed)
+        // ──────────────────────────────────────────────────────────────────
+        stage('Docker Build & Push') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            parallel {
+                stage('Auth Image') {
+                    when { changeset "${APP_ROOT}/backend/auth-service/**" }
+                    steps {
+                        container('docker') {
+                            script { buildAndPush('auth-service') }
+                        }
+                    }
+                }
+                stage('Product Image') {
+                    when { changeset "${APP_ROOT}/backend/product-service/**" }
+                    steps {
+                        container('docker') {
+                            script { buildAndPush('product-service') }
+                        }
+                    }
+                }
+                stage('Cart Image') {
+                    when { changeset "${APP_ROOT}/backend/cart-service/**" }
+                    steps {
+                        container('docker') {
+                            script { buildAndPush('cart-service') }
+                        }
+                    }
+                }
+                stage('Order Image') {
+                    when { changeset "${APP_ROOT}/backend/order-service/**" }
+                    steps {
+                        container('docker') {
+                            script { buildAndPush('order-service') }
+                        }
+                    }
+                }
+                stage('Gateway Image') {
+                    when { changeset "${APP_ROOT}/backend/gateway/**" }
+                    steps {
+                        container('docker') {
+                            script { buildAndPush('gateway') }
+                        }
+                    }
+                }
+                stage('Frontend Image') {
+                    when { changeset "${APP_ROOT}/frontend/**" }
+                    steps {
+                        container('docker') {
+                            script { buildAndPushFrontend() }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 6: Deploy to EKS (per-service rollout)
+        // ──────────────────────────────────────────────────────────────────
+        stage('Deploy to EKS') {
+            when {
+                anyOf { branch 'main'; branch 'develop' }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        def services = [
+                            'auth-service'    : "${APP_ROOT}/backend/auth-service",
+                            'product-service' : "${APP_ROOT}/backend/product-service",
+                            'cart-service'    : "${APP_ROOT}/backend/cart-service",
+                            'order-service'   : "${APP_ROOT}/backend/order-service",
+                            'gateway'         : "${APP_ROOT}/backend/gateway",
+                            'frontend'        : "${APP_ROOT}/frontend"
+                        ]
+                        services.each { svc, path ->
+                            // changeset can only be used in when{}, so emulate per service via git diff
+                            def changed = sh(
+                                script: "git diff --name-only HEAD~1 HEAD | grep -q '^${path}/' && echo yes || echo no",
+                                returnStdout: true
+                            ).trim()
+                            if (changed == 'yes') {
+                                echo "🚀 Rolling out ${svc} → image tag ${IMAGE_TAG}"
+                                sh """
+                                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                                    kubectl -n ${K8S_NAMESPACE} set image deployment/${svc} \
+                                        ${svc}=${ECR_REGISTRY}/superlavish/${svc}:${IMAGE_TAG}
+                                    kubectl -n ${K8S_NAMESPACE} rollout status deployment/${svc} --timeout=5m
+                                """
+                            } else {
+                                echo "⏭️  Skipping ${svc} (no changes)"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 7: Terraform — DEV (auto-apply on dev path changes)
+        // ──────────────────────────────────────────────────────────────────
+        stage('TF Dev VPC') {
+            when { changeset "${APP_ROOT}/devops/terraform/environments/dev/vpc/**" }
+            steps { terraformApply("environments/dev/vpc", auto: true) }
+        }
+        stage('TF Dev EKS') {
+            when { changeset "${APP_ROOT}/devops/terraform/environments/dev/eks/**" }
+            steps { terraformApply("environments/dev/eks", auto: true) }
+        }
+        stage('TF Dev RDS') {
+            when { changeset "${APP_ROOT}/devops/terraform/environments/dev/rds/**" }
+            steps { terraformApply("environments/dev/rds", auto: true) }
+        }
+        stage('TF Dev ALB') {
+            when { changeset "${APP_ROOT}/devops/terraform/environments/dev/alb/**" }
+            steps { terraformApply("environments/dev/alb", auto: true) }
+        }
+        stage('TF Dev S3') {
+            when { changeset "${APP_ROOT}/devops/terraform/environments/dev/s3/**" }
+            steps { terraformApply("environments/dev/s3", auto: true) }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 8: Terraform — STAGING (manual approval)
+        // ──────────────────────────────────────────────────────────────────
+        stage('TF Staging') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "${APP_ROOT}/devops/terraform/environments/staging/vpc/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/staging/eks/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/staging/rds/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/staging/alb/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/staging/s3/**"
+                    }
+                }
+            }
+            steps {
+                input message: 'Apply Terraform changes to STAGING?', ok: 'Apply'
+                script {
+                    ['vpc','eks','rds','alb','s3'].each { comp ->
+                        def changed = sh(
+                            script: "git diff --name-only HEAD~1 HEAD | grep -q '^${APP_ROOT}/devops/terraform/environments/staging/${comp}/' && echo yes || echo no",
+                            returnStdout: true
+                        ).trim()
+                        if (changed == 'yes') {
+                            terraformApply("environments/staging/${comp}", auto: false)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 9: Terraform — PROD (manual approval, plan + apply separately)
+        // ──────────────────────────────────────────────────────────────────
+        stage('TF Prod') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "${APP_ROOT}/devops/terraform/environments/prod/vpc/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/prod/eks/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/prod/rds/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/prod/alb/**"
+                        changeset "${APP_ROOT}/devops/terraform/environments/prod/s3/**"
+                    }
+                }
+            }
+            steps {
+                input message: 'Apply Terraform changes to PROD?', ok: 'Apply to Production'
+                script {
+                    ['vpc','eks','rds','alb','s3'].each { comp ->
+                        def changed = sh(
+                            script: "git diff --name-only HEAD~1 HEAD | grep -q '^${APP_ROOT}/devops/terraform/environments/prod/${comp}/' && echo yes || echo no",
+                            returnStdout: true
+                        ).trim()
+                        if (changed == 'yes') {
+                            terraformApply("environments/prod/${comp}", auto: false)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Stage 10: Smoke Test (only on main, only if anything deployed)
+        // ──────────────────────────────────────────────────────────────────
+        stage('Smoke Test') {
+            when {
+                allOf {
+                    branch 'main'
+                    anyOf {
+                        changeset "${APP_ROOT}/backend/**"
+                        changeset "${APP_ROOT}/frontend/**"
+                    }
+                }
+            }
+            steps {
+                container('kubectl') {
+                    sh '''
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                        kubectl -n ${K8S_NAMESPACE} get pods
+                        kubectl -n ${K8S_NAMESPACE} get svc
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Build #${BUILD_NUMBER} succeeded for ${env.GIT_AUTHOR}"
+        }
+        failure {
+            echo "❌ Build #${BUILD_NUMBER} failed. See logs."
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helper functions
+// ──────────────────────────────────────────────────────────────────────────────
+
+def buildAndPush(String svc) {
+    sh """
+        aws ecr get-login-password --region ${AWS_REGION} | \
+          docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+        docker build \
+          -f ${APP_ROOT}/devops/docker/Dockerfile.service \
+          --build-arg SERVICE_NAME=${svc} \
+          -t ${ECR_REGISTRY}/superlavish/${svc}:${IMAGE_TAG} \
+          -t ${ECR_REGISTRY}/superlavish/${svc}:latest \
+          ${APP_ROOT}/backend/${svc}
+
+        docker push ${ECR_REGISTRY}/superlavish/${svc}:${IMAGE_TAG}
+        docker push ${ECR_REGISTRY}/superlavish/${svc}:latest
+    """
+}
+
+def buildAndPushFrontend() {
+    sh """
+        aws ecr get-login-password --region ${AWS_REGION} | \
+          docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+        docker build \
+          -f ${APP_ROOT}/devops/docker/Dockerfile.frontend \
+          -t ${ECR_REGISTRY}/superlavish/frontend:${IMAGE_TAG} \
+          -t ${ECR_REGISTRY}/superlavish/frontend:latest \
+          ${APP_ROOT}/frontend
+
+        docker push ${ECR_REGISTRY}/superlavish/frontend:${IMAGE_TAG}
+        docker push ${ECR_REGISTRY}/superlavish/frontend:latest
+    """
+}
+
+def terraformApply(String relPath, Map opts = [auto: false]) {
+    container('terraform') {
+        dir("${APP_ROOT}/devops/terraform/${relPath}") {
+            sh 'terraform init -input=false'
+            sh 'terraform fmt -check'
+            sh 'terraform validate'
+            sh 'terraform plan -input=false -out=tfplan'
+            if (opts.auto) {
+                sh 'terraform apply -input=false -auto-approve tfplan'
+            } else {
+                sh 'terraform apply -input=false tfplan'
+            }
+        }
+    }
+}

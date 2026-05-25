@@ -1,0 +1,51 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# AWS Load Balancer Controller Ingress
+# Requires: aws-load-balancer-controller + cert-manager installed in cluster
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: superlavish-ingress
+  namespace: superlavish
+  annotations:
+    # AWS ALB
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:YOUR_REGION:YOUR_ACCOUNT:certificate/YOUR_CERT_ID
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    # WAF
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:YOUR_REGION:YOUR_ACCOUNT:regional/webacl/YOUR_WAF_ID
+    # Group ingresses
+    alb.ingress.kubernetes.io/group.name: superlavish
+spec:
+  rules:
+    # Frontend — root domain
+    - host: superlavish.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+
+    # API — subdomain routes to gateway
+    - host: api.superlavish.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080

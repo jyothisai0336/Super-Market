@@ -1,0 +1,200 @@
+version: '3.9'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SuperLavish — Local Development Docker Compose
+# Run: docker-compose up -d
+# ──────────────────────────────────────────────────────────────────────────────
+
+networks:
+  superlavish-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # DATABASE
+  # ──────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: superlavish-postgres
+    networks: [superlavish-net]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: superlavish_dev
+      POSTGRES_MULTIPLE_DATABASES: superlavish_auth,superlavish_products,superlavish_cart,superlavish_orders
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # MICROSERVICES
+  # ──────────────────────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: ./backend/auth-service
+      dockerfile: ../../devops/docker/Dockerfile.service
+    container_name: superlavish-auth
+    networks: [superlavish-net]
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: superlavish_auth
+      DB_USER: postgres
+      DB_PASSWORD: superlavish_dev
+      JWT_SECRET: superlavish_jwt_secret_replace_in_production_256bits
+      CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  product-service:
+    build:
+      context: ./backend/product-service
+      dockerfile: ../../devops/docker/Dockerfile.service
+    container_name: superlavish-products
+    networks: [superlavish-net]
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SERVER_PORT: 8082
+      DB_HOST: postgres
+      DB_NAME: superlavish_products
+      DB_USER: postgres
+      DB_PASSWORD: superlavish_dev
+      JWT_SECRET: superlavish_jwt_secret_replace_in_production_256bits
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  cart-service:
+    build:
+      context: ./backend/cart-service
+      dockerfile: ../../devops/docker/Dockerfile.service
+    container_name: superlavish-cart
+    networks: [superlavish-net]
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SERVER_PORT: 8083
+      DB_HOST: postgres
+      DB_NAME: superlavish_cart
+      DB_USER: postgres
+      DB_PASSWORD: superlavish_dev
+      JWT_SECRET: superlavish_jwt_secret_replace_in_production_256bits
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  order-service:
+    build:
+      context: ./backend/order-service
+      dockerfile: ../../devops/docker/Dockerfile.service
+    container_name: superlavish-orders
+    networks: [superlavish-net]
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SERVER_PORT: 8084
+      DB_HOST: postgres
+      DB_NAME: superlavish_orders
+      DB_USER: postgres
+      DB_PASSWORD: superlavish_dev
+      JWT_SECRET: superlavish_jwt_secret_replace_in_production_256bits
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: ./backend/gateway
+      dockerfile: ../../devops/docker/Dockerfile.service
+    container_name: superlavish-gateway
+    networks: [superlavish-net]
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      AUTH_SERVICE_URL: http://auth-service:8081
+      PRODUCT_SERVICE_URL: http://product-service:8082
+      CART_SERVICE_URL: http://cart-service:8083
+      ORDER_SERVICE_URL: http://order-service:8084
+      JWT_SECRET: superlavish_jwt_secret_replace_in_production_256bits
+      CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      - auth-service
+      - product-service
+      - cart-service
+      - order-service
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # FRONTEND
+  # ──────────────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../devops/docker/Dockerfile.frontend
+    container_name: superlavish-frontend
+    networks: [superlavish-net]
+    ports:
+      - "3000:80"
+    environment:
+      REACT_APP_API_URL: http://localhost:8080/api
+    depends_on:
+      - gateway
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # MONITORING
+  # ──────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: superlavish-prometheus
+    networks: [superlavish-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./devops/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: superlavish-grafana
+    networks: [superlavish-net]
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./devops/monitoring/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: superlavish_grafana
+      GF_USERS_ALLOW_SIGN_UP: false
+    depends_on:
+      - prometheus
